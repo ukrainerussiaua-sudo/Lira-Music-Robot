@@ -5,57 +5,31 @@ import stat
 import urllib.request
 import zipfile
 
-# Автоустановка библиотек
 def install(package):
     subprocess.check_call([sys.executable, "-m", "pip", "install", package, "-q"])
 
 for pkg in ["python-telegram-bot==21.5", "yt-dlp", "python-dotenv", "requests"]:
     install(pkg)
 
-# ──────────────────────────────────────────────
-# Установка ffmpeg статическим бинарником
-# ──────────────────────────────────────────────
 FFMPEG_DIR = "/tmp/ffmpeg_bin"
 FFMPEG_PATH = os.path.join(FFMPEG_DIR, "ffmpeg")
-FFPROBE_PATH = os.path.join(FFMPEG_DIR, "ffprobe")
 
 def ensure_ffmpeg():
-    # Уже скачан?
     if os.path.exists(FFMPEG_PATH):
         return FFMPEG_DIR
-    # Попробуем системный
     try:
         r = subprocess.run(["ffmpeg", "-version"], capture_output=True)
         if r.returncode == 0:
-            return None  # None = системный, не нужен путь
+            return None
     except Exception:
         pass
-    # Скачиваем статический бинарник
     os.makedirs(FFMPEG_DIR, exist_ok=True)
     print("⬇️ Скачиваю ffmpeg...")
-    url = "https://github.com/nicholasess/ffmpeg-python-binary/releases/download/1.0.0/ffmpeg-release-amd64-static.zip"
-    zip_path = "/tmp/ffmpeg.zip"
-    try:
-        urllib.request.urlretrieve(url, zip_path)
-        with zipfile.ZipFile(zip_path, 'r') as z:
-            for name in z.namelist():
-                if name.endswith("ffmpeg") or name.endswith("ffprobe"):
-                    data = z.read(name)
-                    out = FFMPEG_PATH if name.endswith("ffmpeg") else FFPROBE_PATH
-                    with open(out, "wb") as f:
-                        f.write(data)
-                    os.chmod(out, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)
-        print("✅ ffmpeg установлен")
-        return FFMPEG_DIR
-    except Exception as e:
-        print(f"⚠️ Zip не сработал: {e}, пробую tar.xz...")
-
-    # Запасной — tar.xz от yt-dlp builds
     try:
         import tarfile
-        url2 = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+        url = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
         tar_path = "/tmp/ffmpeg.tar.xz"
-        urllib.request.urlretrieve(url2, tar_path)
+        urllib.request.urlretrieve(url, tar_path)
         with tarfile.open(tar_path) as tar:
             for member in tar.getmembers():
                 bn = os.path.basename(member.name)
@@ -64,17 +38,14 @@ def ensure_ffmpeg():
                     tar.extract(member, FFMPEG_DIR)
                     os.chmod(os.path.join(FFMPEG_DIR, bn),
                              stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)
-        print("✅ ffmpeg установлен (tar.xz)")
+        print("✅ ffmpeg установлен")
         return FFMPEG_DIR
-    except Exception as e2:
-        print(f"❌ ffmpeg не удалось установить: {e2}")
+    except Exception as e:
+        print(f"❌ ffmpeg не удалось установить: {e}")
         return None
 
 FFMPEG_LOCATION = ensure_ffmpeg()
 
-# ──────────────────────────────────────────────
-# Импорты
-# ──────────────────────────────────────────────
 import asyncio
 import re
 import requests
@@ -95,9 +66,10 @@ DOWNLOAD_DIR = "/tmp/music"
 BANNER_PATH = "lira_banner.png"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# ──────────────────────────────────────────────
-# Подписка
-# ──────────────────────────────────────────────
+def esc(text: str) -> str:
+    """Экранируем спецсимволы для HTML"""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 async def is_subscribed(user_id: int, context) -> bool:
     try:
         member = await context.bot.get_chat_member(CHANNEL, user_id)
@@ -111,21 +83,18 @@ async def show_subscribe_screen(chat_id, context):
         [InlineKeyboardButton("✅ Я подписался", callback_data="check_sub")],
     ])
     caption = (
-        "👋 Привет! Добро пожаловать в *Lira Music* 🎵\n\n"
+        "👋 Привет! Добро пожаловать в <b>Lira Music</b> 🎵\n\n"
         "Чтобы пользоваться ботом — подпишись на наш канал!\n\n"
-        "После подписки нажми *«Я подписался»* ✅"
+        "После подписки нажми <b>«Я подписался»</b> ✅"
     )
     if os.path.exists(BANNER_PATH):
         with open(BANNER_PATH, "rb") as p:
             await context.bot.send_photo(chat_id=chat_id, photo=p,
-                caption=caption, parse_mode="Markdown", reply_markup=keyboard)
+                caption=caption, parse_mode="HTML", reply_markup=keyboard)
     else:
         await context.bot.send_message(chat_id=chat_id, text=caption,
-            parse_mode="Markdown", reply_markup=keyboard)
+            parse_mode="HTML", reply_markup=keyboard)
 
-# ──────────────────────────────────────────────
-# Определить тип запроса
-# ──────────────────────────────────────────────
 def detect_source(text: str) -> str:
     t = text.lower()
     if "spotify.com" in t:
@@ -136,9 +105,6 @@ def detect_source(text: str) -> str:
         return "soundcloud"
     return "search"
 
-# ──────────────────────────────────────────────
-# Spotify → название трека
-# ──────────────────────────────────────────────
 def get_spotify_title(url: str) -> str:
     try:
         r = requests.get("https://open.spotify.com/oembed",
@@ -151,9 +117,6 @@ def get_spotify_title(url: str) -> str:
         pass
     return url
 
-# ──────────────────────────────────────────────
-# Скачать аудио
-# ──────────────────────────────────────────────
 def download_audio(query: str, source: str) -> dict:
     if source == "spotify":
         search_q = get_spotify_title(query)
@@ -161,7 +124,7 @@ def download_audio(query: str, source: str) -> dict:
     elif source == "search":
         url = f"ytsearch1:{query}"
     else:
-        url = query  # youtube / soundcloud — прямая ссылка
+        url = query
 
     ydl_opts = {
         "format": "bestaudio/best",
@@ -191,9 +154,6 @@ def download_audio(query: str, source: str) -> dict:
             "filename": filename,
         }
 
-# ──────────────────────────────────────────────
-# Поиск (только для текстовых запросов)
-# ──────────────────────────────────────────────
 def search_tracks(query: str, limit: int = 5) -> list:
     ydl_opts = {"quiet": True, "no_warnings": True, "extract_flat": True}
     if FFMPEG_LOCATION:
@@ -216,32 +176,26 @@ def fmt_duration(seconds) -> str:
     m, s = divmod(int(seconds), 60)
     return f"{m}:{s:02d}"
 
-# ──────────────────────────────────────────────
-# /start
-# ──────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await is_subscribed(user_id, context):
         await show_subscribe_screen(update.effective_chat.id, context)
         return
     caption = (
-        "🎵 *Lira Music* — твой музыкальный бот!\n\n"
+        "🎵 <b>Lira Music</b> — твой музыкальный бот!\n\n"
         "Отправь мне:\n"
-        "🔗 Ссылку на *YouTube / YouTube Music*\n"
-        "🔗 Ссылку на *SoundCloud*\n"
-        "🔗 Ссылку на *Spotify*\n"
-        "🔍 Или просто *название трека*\n\n"
+        "🔗 Ссылку на <b>YouTube / YouTube Music</b>\n"
+        "🔗 Ссылку на <b>SoundCloud</b>\n"
+        "🔗 Ссылку на <b>Spotify</b>\n"
+        "🔍 Или просто <b>название трека</b>\n\n"
         "В группе: @упомяни_бота + запрос 🎧"
     )
     if os.path.exists(BANNER_PATH):
         with open(BANNER_PATH, "rb") as p:
-            await update.message.reply_photo(photo=p, caption=caption, parse_mode="Markdown")
+            await update.message.reply_photo(photo=p, caption=caption, parse_mode="HTML")
     else:
-        await update.message.reply_text(caption, parse_mode="Markdown")
+        await update.message.reply_text(caption, parse_mode="HTML")
 
-# ──────────────────────────────────────────────
-# Callback
-# ──────────────────────────────────────────────
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -253,14 +207,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.delete()
             except Exception:
                 pass
-            caption = "✅ *Подписка подтверждена!*\n\n🎵 Отправь ссылку или название трека 🎧"
+            caption = "✅ <b>Подписка подтверждена!</b>\n\n🎵 Отправь ссылку или название трека 🎧"
             if os.path.exists(BANNER_PATH):
                 with open(BANNER_PATH, "rb") as p:
                     await context.bot.send_photo(chat_id=query.message.chat_id,
-                        photo=p, caption=caption, parse_mode="Markdown")
+                        photo=p, caption=caption, parse_mode="HTML")
             else:
                 await context.bot.send_message(chat_id=query.message.chat_id,
-                    text=caption, parse_mode="Markdown")
+                    text=caption, parse_mode="HTML")
         else:
             await query.answer("❌ Ты ещё не подписан!", show_alert=True)
         return
@@ -270,9 +224,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await query.message.reply_text("⏳ Скачиваю...")
         await _do_download(query.message, context, url, "youtube", msg)
 
-# ──────────────────────────────────────────────
-# Сообщения
-# ──────────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -281,7 +232,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_type = update.effective_chat.type
 
-    # Группа — только по упоминанию
     if chat_type in ("group", "supergroup"):
         bot_username = (await context.bot.get_me()).username
         mention = f"@{bot_username}"
@@ -293,7 +243,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_query(update, context, text)
         return
 
-    # Личка — проверяем подписку
     if not await is_subscribed(user_id, context):
         await show_subscribe_screen(update.effective_chat.id, context)
         return
@@ -303,15 +252,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _handle_query(update, context, text):
     source = detect_source(text)
 
-    # Ссылки — сразу скачиваем
     if source in ("youtube", "soundcloud", "spotify"):
-        label = {"youtube": "YouTube", "soundcloud": "SoundCloud", "spotify": "Spotify"}[source]
-        msg = await update.message.reply_text(f"⏳ Скачиваю с {label}...")
+        labels = {"youtube": "YouTube", "soundcloud": "SoundCloud", "spotify": "Spotify"}
+        msg = await update.message.reply_text(f"⏳ Скачиваю с {labels[source]}...")
         await _do_download(update.message, context, text, source, msg)
         return
 
-    # Текст — показываем список
-    msg = await update.message.reply_text(f"🔍 Ищу: *{text}*...", parse_mode="Markdown")
+    msg = await update.message.reply_text(f"🔍 Ищу: <b>{esc(text)}</b>...", parse_mode="HTML")
     try:
         loop = asyncio.get_event_loop()
         results = await loop.run_in_executor(None, lambda: search_tracks(text))
@@ -325,16 +272,13 @@ async def _handle_query(update, context, text):
             keyboard.append([InlineKeyboardButton(label, callback_data=f"dl|{r['url']}")])
 
         await msg.edit_text(
-            f"🎵 Результаты для: *{text}*\n\nВыбери трек 👇",
+            f"🎵 Результаты для: <b>{esc(text)}</b>\n\nВыбери трек 👇",
             reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка поиска: {e}")
 
-# ──────────────────────────────────────────────
-# Скачать и отправить
-# ──────────────────────────────────────────────
 async def _do_download(message, context, url, source, msg):
     try:
         loop = asyncio.get_event_loop()
@@ -351,7 +295,7 @@ async def _do_download(message, context, url, source, msg):
             os.remove(filepath)
             return
 
-        await msg.edit_text(f"📤 Отправляю: *{info['title']}*...", parse_mode="Markdown")
+        await msg.edit_text(f"📤 Отправляю: <b>{esc(info['title'])}</b>...", parse_mode="HTML")
 
         thumb = None
         if info.get("thumbnail"):
@@ -371,12 +315,12 @@ async def _do_download(message, context, url, source, msg):
                 duration=info["duration"],
                 thumbnail=thumb,
                 caption=(
-                    f"🎵 *{info['title']}*\n"
-                    f"👤 {info['uploader']}\n"
+                    f"🎵 <b>{esc(info['title'])}</b>\n"
+                    f"👤 {esc(info['uploader'])}\n"
                     f"⏱ {fmt_duration(info['duration'])}\n\n"
-                    f"_Lira Music_ 🎧"
+                    f"<i>Lira Music</i> 🎧"
                 ),
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
 
         await msg.delete()
@@ -390,9 +334,6 @@ async def _do_download(message, context, url, source, msg):
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
 
-# ──────────────────────────────────────────────
-# Запуск
-# ──────────────────────────────────────────────
 def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN не найден в .env!")
