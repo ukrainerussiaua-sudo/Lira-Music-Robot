@@ -40,45 +40,47 @@ def ensure_ffmpeg():
         print("✅ ffmpeg установлен")
         return FFMPEG_DIR
     except Exception as e:
-        print(f"❌ ffmpeg не удалось установить: {e}")
+        print(f"❌ ffmpeg: {e}")
         return None
 
 FFMPEG_LOCATION = ensure_ffmpeg()
 
 import asyncio
 import re
+import uuid
 import requests
 from io import BytesIO
 from dotenv import load_dotenv
 import yt_dlp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    InlineQueryResultArticle, InputTextMessageContent,
+    InlineQueryResultAudio
+)
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    CallbackQueryHandler, ContextTypes, filters,
+    InlineQueryHandler
 )
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "Lira_music_robot")  # без @
+BOT_USERNAME = os.getenv("BOT_USERNAME", "Lira_music_robot")
 CHANNEL = "@Lira_projects"
 DOWNLOAD_DIR = "/tmp/music"
 BANNER_PATH = "lira_banner.png"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# yt-dlp настройки против 403
 YDL_BASE = {
     "quiet": True,
     "no_warnings": True,
     "http_headers": {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     },
     "extractor_args": {
-        "youtube": {
-            "player_client": ["android", "web"],
-        }
+        "youtube": {"player_client": ["android", "web"]},
     },
 }
 
@@ -132,14 +134,43 @@ def get_spotify_title(url: str) -> str:
         pass
     return url
 
+def search_tracks(query: str, limit: int = 5) -> list:
+    ydl_opts = {**YDL_BASE, "extract_flat": True}
+    if FFMPEG_LOCATION:
+        ydl_opts["ffmpeg_location"] = FFMPEG_LOCATION
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+        results = []
+        for entry in info.get("entries", []):
+            results.append({
+                "title": entry.get("title", "Unknown"),
+                "url": f"https://youtube.com/watch?v={entry.get('id')}",
+                "duration": entry.get("duration", 0),
+                "uploader": entry.get("uploader", ""),
+                "thumbnail": entry.get("thumbnail", ""),
+            })
+        return results
+
 def download_audio(query: str, source: str) -> dict:
-    if source == "spotify":
+    # SoundCloud DRM → ищем на YouTube
+    if source == "soundcloud":
+        try:
+            ydl_check = {**YDL_BASE, "extract_flat": True}
+            with yt_dlp.YoutubeDL(ydl_check) as ydl:
+                info = ydl.extract_info(query, download=False)
+                title = info.get("title", "")
+                uploader = info.get("uploader", "")
+                search_q = f"{uploader} {title}" if uploader else title
+            url = f"ytsearch1:{search_q}"
+        except Exception:
+            url = f"ytsearch1:{query}"
+    elif source == "spotify":
         search_q = get_spotify_title(query)
         url = f"ytsearch1:{search_q}"
     elif source == "search":
         url = f"ytsearch1:{query}"
     else:
-        url = query
+        url = query  # youtube прямая ссылка
 
     ydl_opts = {
         **YDL_BASE,
@@ -168,28 +199,15 @@ def download_audio(query: str, source: str) -> dict:
             "filename": filename,
         }
 
-def search_tracks(query: str, limit: int = 5) -> list:
-    ydl_opts = {**YDL_BASE, "extract_flat": True}
-    if FFMPEG_LOCATION:
-        ydl_opts["ffmpeg_location"] = FFMPEG_LOCATION
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-        results = []
-        for entry in info.get("entries", []):
-            results.append({
-                "title": entry.get("title", "Unknown"),
-                "url": f"https://youtube.com/watch?v={entry.get('id')}",
-                "duration": entry.get("duration", 0),
-                "uploader": entry.get("uploader", ""),
-            })
-        return results
-
 def fmt_duration(seconds) -> str:
     if not seconds:
         return "?"
     m, s = divmod(int(seconds), 60)
     return f"{m}:{s:02d}"
 
+# ──────────────────────────────────────────────
+# /start
+# ──────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await is_subscribed(user_id, context):
@@ -197,12 +215,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     caption = (
         "🎵 <b>Lira Music</b> — твой музыкальный бот!\n\n"
-        "Отправь мне:\n"
-        "🔗 Ссылку на <b>YouTube / YouTube Music</b>\n"
-        "🔗 Ссылку на <b>SoundCloud</b>\n"
-        "🔗 Ссылку на <b>Spotify</b>\n"
+        "В личке отправь:\n"
+        "🔗 Ссылку на <b>YouTube / SoundCloud / Spotify</b>\n"
         "🔍 Или просто <b>название трека</b>\n\n"
-        "В группе: @упомяни_бота + запрос 🎧"
+        "В группе пиши прямо в поле сообщения:\n"
+        f"<code>@{BOT_USERNAME} название трека</code>\n\n"
+        "Выбирай из списка и трек отправится в чат 🎧"
     )
     if os.path.exists(BANNER_PATH):
         with open(BANNER_PATH, "rb") as p:
@@ -210,9 +228,78 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(caption, parse_mode="HTML")
 
+# ──────────────────────────────────────────────
+# INLINE режим — работает в группах без добавления бота
+# ──────────────────────────────────────────────
+async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query_text = update.inline_query.query.strip()
+
+    if not query_text:
+        # Подсказка если запрос пустой
+        results = [
+            InlineQueryResultArticle(
+                id="hint",
+                title="🎵 Lira Music",
+                description="Введи название трека для поиска",
+                input_message_content=InputTextMessageContent(
+                    f"🎵 <b>Lira Music</b>\nИспользуй: <code>@{BOT_USERNAME} название трека</code>",
+                    parse_mode="HTML"
+                ),
+            )
+        ]
+        await update.inline_query.answer(results, cache_time=5)
+        return
+
+    try:
+        loop = asyncio.get_event_loop()
+        tracks = await loop.run_in_executor(None, lambda: search_tracks(query_text, 5))
+    except Exception:
+        tracks = []
+
+    results = []
+    for track in tracks:
+        duration_str = fmt_duration(track["duration"])
+        desc = f"👤 {track['uploader']} • ⏱ {duration_str}"
+
+        results.append(
+            InlineQueryResultArticle(
+                id=str(uuid.uuid4()),
+                title=f"🎵 {track['title']}",
+                description=desc,
+                input_message_content=InputTextMessageContent(
+                    f"🎵 <b>{esc(track['title'])}</b>\n"
+                    f"👤 {esc(track['uploader'])}\n\n"
+                    f"⏳ Скачиваю...\n\n"
+                    f"<a href='https://t.me/{BOT_USERNAME}'>🎧 Lira Music</a>",
+                    parse_mode="HTML"
+                ),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "⏳ Загружаю трек...",
+                        callback_data=f"inline_dl|{track['url']}"
+                    )
+                ]])
+            )
+        )
+
+    if not results:
+        results = [
+            InlineQueryResultArticle(
+                id="noresult",
+                title="❌ Ничего не найдено",
+                description=f"По запросу «{query_text}» ничего нет",
+                input_message_content=InputTextMessageContent("❌ Ничего не найдено"),
+            )
+        ]
+
+    await update.inline_query.answer(results, cache_time=10)
+
+# ──────────────────────────────────────────────
+# Callback
+# ──────────────────────────────────────────────
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await query.answer("⏳ Скачиваю, подожди...")
     data = query.data
 
     if data == "check_sub":
@@ -233,11 +320,92 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ Ты ещё не подписан!", show_alert=True)
         return
 
+    # Скачивание из лички
     if data.startswith("dl|"):
         url = data[3:]
         msg = await query.message.reply_text("⏳ Скачиваю...")
         await _do_download(query.message, context, url, "youtube", msg)
+        return
 
+    # Скачивание из inline (в группе)
+    if data.startswith("inline_dl|"):
+        url = data[10:]
+        chat_id = query.message.chat_id
+        user = query.from_user.first_name
+
+        try:
+            # Обновляем сообщение
+            await query.edit_message_text(
+                f"⏳ <b>{user}</b> скачивает трек...",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+        try:
+            loop = asyncio.get_event_loop()
+            info = await loop.run_in_executor(None, lambda: download_audio(url, "youtube"))
+
+            filepath = info["filename"]
+            if not os.path.exists(filepath):
+                await query.edit_message_text("❌ Ошибка скачивания")
+                return
+
+            size_mb = os.path.getsize(filepath) / 1024 / 1024
+            if size_mb > 50:
+                await query.edit_message_text("❌ Файл слишком большой (>50MB)")
+                os.remove(filepath)
+                return
+
+            thumb = None
+            if info.get("thumbnail"):
+                try:
+                    resp = requests.get(info["thumbnail"], timeout=10)
+                    if resp.status_code == 200:
+                        thumb = BytesIO(resp.content)
+                        thumb.name = "thumb.jpg"
+                except Exception:
+                    pass
+
+            caption = (
+                f"🎵 <b>{esc(info['title'])}</b>\n"
+                f"👤 {esc(info['uploader'])}\n\n"
+                f"<a href='https://t.me/{BOT_USERNAME}'>🎧 Lira Music</a>"
+            )
+
+            with open(filepath, "rb") as f:
+                await context.bot.send_audio(
+                    chat_id=chat_id,
+                    audio=f,
+                    title=info["title"],
+                    performer=info["uploader"],
+                    duration=info["duration"],
+                    thumbnail=thumb,
+                    caption=caption,
+                    parse_mode="HTML"
+                )
+
+            # Удаляем промежуточное сообщение
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+
+            os.remove(filepath)
+            for ext in [".jpg", ".jpeg", ".png", ".webp"]:
+                tp = filepath.replace(".mp3", ext)
+                if os.path.exists(tp):
+                    os.remove(tp)
+
+        except Exception as e:
+            try:
+                await query.edit_message_text(f"❌ Ошибка: {e}")
+            except Exception:
+                pass
+
+# ──────────────────────────────────────────────
+# Личные сообщения
+# ──────────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -246,27 +414,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_type = update.effective_chat.type
 
-    # Группа — реагируем на упоминание
+    # В группах не обрабатываем обычные сообщения — только inline
     if chat_type in ("group", "supergroup"):
-        me = await context.bot.get_me()
-        bot_username = me.username
-        mention = f"@{bot_username}"
-
-        if mention.lower() not in text.lower():
-            return
-
-        # Убираем упоминание бота из текста
-        query_text = re.sub(re.escape(mention), "", text, flags=re.IGNORECASE).strip()
-        if not query_text:
-            await update.message.reply_text(
-                "🎵 Напиши название трека или ссылку после упоминания бота!\n"
-                f"Пример: {mention} название трека"
-            )
-            return
-        await _handle_query(update, context, query_text)
         return
 
-    # Личка
     if not await is_subscribed(user_id, context):
         await show_subscribe_screen(update.effective_chat.id, context)
         return
@@ -310,12 +461,12 @@ async def _do_download(message, context, url, source, msg):
 
         filepath = info["filename"]
         if not os.path.exists(filepath):
-            await msg.edit_text("❌ Файл не найден после скачивания")
+            await msg.edit_text("❌ Файл не найден")
             return
 
         size_mb = os.path.getsize(filepath) / 1024 / 1024
         if size_mb > 50:
-            await msg.edit_text("❌ Файл слишком большой (>50MB) для Telegram")
+            await msg.edit_text("❌ Файл >50MB, не влезет в Telegram")
             os.remove(filepath)
             return
 
@@ -331,7 +482,6 @@ async def _do_download(message, context, url, source, msg):
             except Exception:
                 pass
 
-        # Подпись: имя, автор, кликабельная ссылка на бота
         caption = (
             f"🎵 <b>{esc(info['title'])}</b>\n"
             f"👤 {esc(info['uploader'])}\n\n"
@@ -351,7 +501,6 @@ async def _do_download(message, context, url, source, msg):
 
         await msg.delete()
         os.remove(filepath)
-
         for ext in [".jpg", ".jpeg", ".png", ".webp"]:
             tp = filepath.replace(".mp3", ext)
             if os.path.exists(tp):
@@ -360,6 +509,9 @@ async def _do_download(message, context, url, source, msg):
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
 
+# ──────────────────────────────────────────────
+# Запуск
+# ──────────────────────────────────────────────
 def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN не найден в .env!")
@@ -367,6 +519,7 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(InlineQueryHandler(inline_query))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
