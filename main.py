@@ -3,7 +3,6 @@ import sys
 import os
 import stat
 import urllib.request
-import zipfile
 
 def install(package):
     subprocess.check_call([sys.executable, "-m", "pip", "install", package, "-q"])
@@ -61,13 +60,29 @@ from telegram.ext import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "Lira_music_robot")  # без @
 CHANNEL = "@Lira_projects"
 DOWNLOAD_DIR = "/tmp/music"
 BANNER_PATH = "lira_banner.png"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+# yt-dlp настройки против 403
+YDL_BASE = {
+    "quiet": True,
+    "no_warnings": True,
+    "http_headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    },
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "web"],
+        }
+    },
+}
+
 def esc(text: str) -> str:
-    """Экранируем спецсимволы для HTML"""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 async def is_subscribed(user_id: int, context) -> bool:
@@ -127,6 +142,7 @@ def download_audio(query: str, source: str) -> dict:
         url = query
 
     ydl_opts = {
+        **YDL_BASE,
         "format": "bestaudio/best",
         "outtmpl": f"{DOWNLOAD_DIR}/%(title)s.%(ext)s",
         "postprocessors": [{
@@ -135,8 +151,6 @@ def download_audio(query: str, source: str) -> dict:
             "preferredquality": "192",
         }],
         "writethumbnail": True,
-        "quiet": True,
-        "no_warnings": True,
     }
     if FFMPEG_LOCATION:
         ydl_opts["ffmpeg_location"] = FFMPEG_LOCATION
@@ -155,7 +169,7 @@ def download_audio(query: str, source: str) -> dict:
         }
 
 def search_tracks(query: str, limit: int = 5) -> list:
-    ydl_opts = {"quiet": True, "no_warnings": True, "extract_flat": True}
+    ydl_opts = {**YDL_BASE, "extract_flat": True}
     if FFMPEG_LOCATION:
         ydl_opts["ffmpeg_location"] = FFMPEG_LOCATION
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -232,17 +246,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_type = update.effective_chat.type
 
+    # Группа — реагируем на упоминание
     if chat_type in ("group", "supergroup"):
-        bot_username = (await context.bot.get_me()).username
+        me = await context.bot.get_me()
+        bot_username = me.username
         mention = f"@{bot_username}"
+
         if mention.lower() not in text.lower():
             return
-        text = re.sub(re.escape(mention), "", text, flags=re.IGNORECASE).strip()
-        if not text:
+
+        # Убираем упоминание бота из текста
+        query_text = re.sub(re.escape(mention), "", text, flags=re.IGNORECASE).strip()
+        if not query_text:
+            await update.message.reply_text(
+                "🎵 Напиши название трека или ссылку после упоминания бота!\n"
+                f"Пример: {mention} название трека"
+            )
             return
-        await _handle_query(update, context, text)
+        await _handle_query(update, context, query_text)
         return
 
+    # Личка
     if not await is_subscribed(user_id, context):
         await show_subscribe_screen(update.effective_chat.id, context)
         return
@@ -307,6 +331,13 @@ async def _do_download(message, context, url, source, msg):
             except Exception:
                 pass
 
+        # Подпись: имя, автор, кликабельная ссылка на бота
+        caption = (
+            f"🎵 <b>{esc(info['title'])}</b>\n"
+            f"👤 {esc(info['uploader'])}\n\n"
+            f"<a href='https://t.me/{BOT_USERNAME}'>🎧 Lira Music</a>"
+        )
+
         with open(filepath, "rb") as f:
             await message.reply_audio(
                 audio=f,
@@ -314,12 +345,7 @@ async def _do_download(message, context, url, source, msg):
                 performer=info["uploader"],
                 duration=info["duration"],
                 thumbnail=thumb,
-                caption=(
-                    f"🎵 <b>{esc(info['title'])}</b>\n"
-                    f"👤 {esc(info['uploader'])}\n"
-                    f"⏱ {fmt_duration(info['duration'])}\n\n"
-                    f"<i>Lira Music</i> 🎧"
-                ),
+                caption=caption,
                 parse_mode="HTML"
             )
 
@@ -345,7 +371,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("✅ Lira Music Bot запущен!")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
