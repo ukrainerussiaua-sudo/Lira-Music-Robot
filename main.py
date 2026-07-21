@@ -24,7 +24,6 @@ import yt_dlp
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     InlineQueryResultArticle, InputTextMessageContent,
-    InlineQueryResultCachedAudio,
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -38,18 +37,13 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "Lira_music_robot")
 CHANNEL = "@Lira_projects"
 DOWNLOAD_DIR = "/tmp/music"
-CACHE_DIR = "/tmp/audio_cache"
 BANNER_PATH = "lira_banner.png"
 FFMPEG_DIR = "/tmp/ffmpeg_bin"
 FFMPEG_PATH = os.path.join(FFMPEG_DIR, "ffmpeg")
 MAX_DURATION = 10 * 60
 IDLE_TIMEOUT = 30 * 60
 
-# file_id кэш: youtube_url → telegram file_id
-audio_cache: dict = {}
-
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-os.makedirs(CACHE_DIR, exist_ok=True)
 print(f"Токен: {'OK' if BOT_TOKEN else '❌ НЕ НАЙДЕН!'}")
 print(f"Баннер: {'OK' if os.path.exists(BANNER_PATH) else 'нет'}")
 
@@ -90,6 +84,8 @@ def find_or_download_ffmpeg():
 
 threading.Thread(target=find_or_download_ffmpeg, daemon=True).start()
 
+# Очередь треков: track_id → info
+pending_tracks: dict = {}
 user_last_action: dict = {}
 user_reminder_sent: dict = {}
 
@@ -169,8 +165,7 @@ def get_spotify_title(url: str) -> str:
 
 def get_soundcloud_query(url: str) -> str:
     try:
-        opts = {"quiet": True, "no_warnings": True, "extract_flat": True,
-                "http_headers": {"User-Agent": "Mozilla/5.0"}}
+        opts = {"quiet": True, "no_warnings": True, "extract_flat": True}
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             t = info.get("title", "")
@@ -231,7 +226,6 @@ def download_audio(url: str, source: str) -> dict:
             "uploader": info.get("uploader", "Unknown"),
             "thumbnail": info.get("thumbnail"),
             "filename": filename,
-            "youtube_url": f"https://youtube.com/watch?v={info.get('id', '')}",
         }
 
 def get_thumb(url):
@@ -250,50 +244,7 @@ def cleanup(filepath):
         try: os.remove(filepath.replace(".mp3", ext))
         except Exception: pass
 
-# ──────────────────────────────────────────────
-# Загрузить аудио в Telegram и получить file_id
-# ──────────────────────────────────────────────
-UPLOAD_CHAT_ID = os.getenv("UPLOAD_CHAT_ID")  # ID личного чата с ботом для кэша
-
-async def upload_and_cache(context, info: dict) -> str | None:
-    """Загружает MP3 в Telegram, возвращает file_id"""
-    youtube_url = info.get("youtube_url", "")
-
-    # Уже есть в кэше?
-    if youtube_url and youtube_url in audio_cache:
-        return audio_cache[youtube_url]
-
-    if not UPLOAD_CHAT_ID:
-        return None
-
-    filepath = info["filename"]
-    if not os.path.exists(filepath):
-        return None
-
-    try:
-        thumb = get_thumb(info["thumbnail"]) if info.get("thumbnail") else None
-        with open(filepath, "rb") as f:
-            msg = await context.bot.send_audio(
-                chat_id=int(UPLOAD_CHAT_ID),
-                audio=f,
-                title=info["title"],
-                performer=info["uploader"],
-                duration=info["duration"],
-                thumbnail=thumb,
-            )
-        file_id = msg.audio.file_id
-        if youtube_url:
-            audio_cache[youtube_url] = file_id
-        print(f"✅ Кэшировано: {info['title']} → {file_id}")
-        return file_id
-    except Exception as e:
-        print(f"❌ upload_and_cache: {e}")
-        return None
-
-# ──────────────────────────────────────────────
-# 30-минутный напоминальщик
-# ──────────────────────────────────────────────
-async def idle_reminder_loop(app: Application):
+async def idle_reminder_loop(app):
     while True:
         await asyncio.sleep(60)
         now = time.time()
@@ -307,21 +258,39 @@ async def idle_reminder_loop(app: Application):
                         pass
 
 # ──────────────────────────────────────────────
-# /start
+# /start — проверяем есть ли pending трек
 # ──────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     update_activity(user_id)
+
+    # Проверяем deep link — пришёл из группы за треком
+    if context.args and context.args[0].startswith("track_"):
+        track_id = context.args[0]
+        if track_id in pending_tracks:
+            track_info = pending_tracks[track_id]
+            # Проверяем подписку
+            if not await is_subscribed(user_id, context):
+                # Сохраняем track_id чтобы после подписки отдать трек
+                context.user_data["pending_track"] = track_id
+                await show_subscribe_screen(update.effective_chat.id, context)
+                return
+            # Скачиваем и отправляем
+            msg = await update.message.reply_text(
+                f"⏳ Скачиваю <b>{esc(track_info['title'])}</b>...",
+                parse_mode="HTML"
+            )
+            await _do_download(update.message, context, track_info["url"], "youtube", msg)
+            del pending_tracks[track_id]
+            return
+
     if not await is_subscribed(user_id, context):
         await show_subscribe_screen(update.effective_chat.id, context)
         return
-    # Запоминаем chat_id для кэша если не задан
-    if not UPLOAD_CHAT_ID:
-        os.environ["UPLOAD_CHAT_ID"] = str(update.effective_chat.id)
     await send_welcome(update.effective_chat.id, context)
 
 # ──────────────────────────────────────────────
-# Inline — показываем результаты поиска
+# Inline — поиск, в чат летит анонс с кнопкой
 # ──────────────────────────────────────────────
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.inline_query.query.strip()
@@ -347,33 +316,34 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     results = []
     for t in tracks:
-        url = t["url"]
-        # Если уже есть file_id — отдаём CachedAudio (сразу в чат!)
-        if url in audio_cache:
-            results.append(InlineQueryResultCachedAudio(
-                id=str(uuid.uuid4()),
-                audio_file_id=audio_cache[url],
-                caption=(
-                    f"🎵 <b>{esc(t['title'])}</b>\n"
-                    f"👤 {esc(t['uploader'])}\n\n"
-                    f"<a href='https://t.me/{BOT_USERNAME}'>🎧 Lira Music</a>"
-                ),
-                parse_mode="HTML",
-            ))
-        else:
-            # Иначе — статья с кнопкой скачать
-            results.append(InlineQueryResultArticle(
-                id=url,
-                title=f"🎵 {t['title']}",
-                description=f"👤 {t['uploader']} • ⏱ {fmt_duration(t['duration'])}",
-                input_message_content=InputTextMessageContent(
-                    f"🎵 <b>{esc(t['title'])}</b>\n"
-                    f"👤 {esc(t['uploader'])}\n\n"
-                    f"⏳ Скачиваю...\n\n"
-                    f"<a href='https://t.me/{BOT_USERNAME}'>🎧 Lira Music</a>",
-                    parse_mode="HTML"
-                ),
-            ))
+        # Создаём уникальный ID для трека
+        track_id = f"track_{uuid.uuid4().hex[:12]}"
+        pending_tracks[track_id] = {
+            "title": t["title"],
+            "uploader": t["uploader"],
+            "duration": t["duration"],
+            "url": t["url"],
+        }
+
+        deep_link = f"https://t.me/{BOT_USERNAME}?start={track_id}"
+
+        results.append(InlineQueryResultArticle(
+            id=track_id,
+            title=f"🎵 {t['title']}",
+            description=f"👤 {t['uploader']} • ⏱ {fmt_duration(t['duration'])}",
+            input_message_content=InputTextMessageContent(
+                f"🎵 <b>{esc(t['title'])}</b>\n"
+                f"👤 {esc(t['uploader'])} • ⏱ {fmt_duration(t['duration'])}\n\n"
+                f"<a href='https://t.me/{BOT_USERNAME}'>🎧 Lira Music</a>",
+                parse_mode="HTML"
+            ),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "🎵 Слушать",
+                    url=deep_link
+                )
+            ]])
+        ))
 
     if not results:
         results = [InlineQueryResultArticle(
@@ -382,59 +352,6 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )]
 
     await update.inline_query.answer(results, cache_time=10)
-
-# ──────────────────────────────────────────────
-# chosen_inline_result — скачиваем и кэшируем
-# ──────────────────────────────────────────────
-async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    result = update.chosen_inline_result
-    url = result.result_id
-    user_id = result.from_user.id
-    update_activity(user_id)
-
-    if url in ("hint", "no"):
-        return
-
-    # Уже кэшировано — ничего делать не надо, Telegram сам отправил
-    if url in audio_cache:
-        return
-
-    # Скачиваем
-    try:
-        info = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: download_audio(url, "youtube"))
-
-        filepath = info["filename"]
-        if not os.path.exists(filepath):
-            return
-
-        if os.path.getsize(filepath) / 1024 / 1024 > 50:
-            cleanup(filepath)
-            return
-
-        # Загружаем в Telegram и кэшируем file_id
-        file_id = await upload_and_cache(context, info)
-        cleanup(filepath)
-
-        if not file_id:
-            # Если нет UPLOAD_CHAT_ID — отправляем в личку
-            thumb = get_thumb(info["thumbnail"]) if info.get("thumbnail") else None
-            caption = (
-                f"🎵 <b>{esc(info['title'])}</b>\n"
-                f"👤 {esc(info['uploader'])}\n\n"
-                f"<a href='https://t.me/{BOT_USERNAME}'>🎧 Lira Music</a>"
-            )
-            with open(filepath, "rb") as f:
-                await context.bot.send_audio(
-                    chat_id=user_id, audio=f,
-                    title=info["title"], performer=info["uploader"],
-                    duration=info["duration"], thumbnail=thumb,
-                    caption=caption, parse_mode="HTML"
-                )
-            cleanup(filepath)
-
-    except Exception as e:
-        print(f"❌ chosen_inline: {e}")
 
 # ──────────────────────────────────────────────
 # Callback
@@ -449,7 +366,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if await is_subscribed(q.from_user.id, context):
             try: await q.message.delete()
             except Exception: pass
-            await send_welcome(q.message.chat_id, context)
+            # Есть ли pending трек после подписки?
+            pending = context.user_data.get("pending_track")
+            if pending and pending in pending_tracks:
+                track_info = pending_tracks[pending]
+                msg = await context.bot.send_message(
+                    chat_id=q.message.chat_id,
+                    text=f"⏳ Скачиваю <b>{esc(track_info['title'])}</b>...",
+                    parse_mode="HTML"
+                )
+                # Создаём фейковый message объект
+                await _do_download_by_chat(q.message.chat_id, context,
+                                           track_info["url"], "youtube", msg)
+                del pending_tracks[pending]
+                context.user_data.pop("pending_track", None)
+            else:
+                await send_welcome(q.message.chat_id, context)
         else:
             await q.answer("❌ Ты ещё не подписан!", show_alert=True)
         return
@@ -469,10 +401,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_id = update.effective_user.id
     update_activity(user_id)
-
-    # Запоминаем chat_id для кэша
-    if not UPLOAD_CHAT_ID:
-        os.environ["UPLOAD_CHAT_ID"] = str(update.effective_chat.id)
 
     if not await is_subscribed(user_id, context):
         await show_subscribe_screen(update.effective_chat.id, context)
@@ -526,23 +454,43 @@ async def _do_download(message, context, url, source, msg):
             f"<a href='https://t.me/{BOT_USERNAME}'>🎧 Lira Music</a>"
         )
         with open(filepath, "rb") as f:
-            sent = await message.reply_audio(
+            await message.reply_audio(
                 audio=f, title=info["title"], performer=info["uploader"],
                 duration=info["duration"], thumbnail=thumb,
                 caption=caption, parse_mode="HTML")
-        # Кэшируем file_id для inline
-        yt_url = info.get("youtube_url", "")
-        if yt_url and yt_url not in audio_cache:
-            audio_cache[yt_url] = sent.audio.file_id
-            print(f"✅ Кэш из лички: {info['title']}")
         await msg.delete()
         cleanup(filepath)
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
 
-# ──────────────────────────────────────────────
-# Запуск
-# ──────────────────────────────────────────────
+async def _do_download_by_chat(chat_id, context, url, source, msg):
+    try:
+        info = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: download_audio(url, source))
+        filepath = info["filename"]
+        if not os.path.exists(filepath):
+            await msg.edit_text("❌ Файл не найден"); return
+        if os.path.getsize(filepath) / 1024 / 1024 > 50:
+            await msg.edit_text("❌ Файл >50MB"); cleanup(filepath); return
+        await msg.edit_text(
+            f"📤 Отправляю: <b>{esc(info['title'])}</b>...", parse_mode="HTML")
+        thumb = get_thumb(info["thumbnail"]) if info.get("thumbnail") else None
+        caption = (
+            f"🎵 <b>{esc(info['title'])}</b>\n"
+            f"👤 {esc(info['uploader'])}\n\n"
+            f"<a href='https://t.me/{BOT_USERNAME}'>🎧 Lira Music</a>"
+        )
+        with open(filepath, "rb") as f:
+            await context.bot.send_audio(
+                chat_id=chat_id, audio=f,
+                title=info["title"], performer=info["uploader"],
+                duration=info["duration"], thumbnail=thumb,
+                caption=caption, parse_mode="HTML")
+        await msg.delete()
+        cleanup(filepath)
+    except Exception as e:
+        await msg.edit_text(f"❌ Ошибка: {e}")
+
 async def post_init(app: Application):
     asyncio.create_task(idle_reminder_loop(app))
 
@@ -552,7 +500,6 @@ def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(InlineQueryHandler(inline_query))
-    app.add_handler(ChosenInlineResultHandler(chosen_inline_result))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("✅ Lira Music Bot запущен!")
