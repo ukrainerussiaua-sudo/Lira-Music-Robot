@@ -227,7 +227,6 @@ def download_audio(url: str, source: str) -> dict:
         url = f"ytsearch1:{url}"
 
     base_opts = {
-        "format": "bestaudio/best",
         "outtmpl": f"{DOWNLOAD_DIR}/%(title)s.%(ext)s",
         "postprocessors": [{"key": "FFmpegExtractAudio",
                             "preferredcodec": "mp3", "preferredquality": "192"}],
@@ -237,34 +236,42 @@ def download_audio(url: str, source: str) -> dict:
     if FFMPEG_LOCATION:
         base_opts["ffmpeg_location"] = FFMPEG_LOCATION
 
+    # Форматы для перебора
+    formats = ["bestaudio/best", "bestaudio", "best", "worstaudio/worst", "140", "251", "250"]
+
     last_error = None
     for client in YT_CLIENTS:
-        try:
-            opts = make_ydl_opts({
-                **base_opts,
-                "extractor_args": {"youtube": {"player_client": client}},
-            })
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if "entries" in info:
-                    info = info["entries"][0]
-                filename = ydl.prepare_filename(info).rsplit(".", 1)[0] + ".mp3"
-                return {
-                    "title": info.get("title", "Unknown"),
-                    "duration": info.get("duration", 0),
-                    "uploader": info.get("uploader", "Unknown"),
-                    "thumbnail": info.get("thumbnail"),
-                    "filename": filename,
-                }
-        except Exception as e:
-            last_error = e
-            err_str = str(e).lower()
-            if "sign in" in err_str or "bot" in err_str or "403" in err_str:
-                print(f"⚠️ Клиент {client} заблокирован, пробую следующий...")
-                continue
-            raise e
+        for fmt in formats:
+            try:
+                opts = make_ydl_opts({
+                    **base_opts,
+                    "format": fmt,
+                    "extractor_args": {"youtube": {"player_client": client}},
+                })
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if "entries" in info:
+                        info = info["entries"][0]
+                    filename = ydl.prepare_filename(info).rsplit(".", 1)[0] + ".mp3"
+                    return {
+                        "title": info.get("title", "Unknown"),
+                        "duration": info.get("duration", 0),
+                        "uploader": info.get("uploader", "Unknown"),
+                        "thumbnail": info.get("thumbnail"),
+                        "filename": filename,
+                    }
+            except Exception as e:
+                last_error = e
+                err_str = str(e).lower()
+                if "sign in" in err_str or "bot" in err_str or "403" in err_str:
+                    print(f"⚠️ Клиент {client} заблокирован, пробую следующий...")
+                    break  # переходим к следующему клиенту
+                if "not available" in err_str or "format" in err_str:
+                    print(f"⚠️ Формат {fmt} недоступен, пробую следующий...")
+                    continue  # пробуем следующий формат
+                raise e
 
-    raise Exception(f"Все клиенты заблокированы YouTube: {last_error}")
+    raise Exception(f"Не удалось скачать: {last_error}")
 
 def get_thumb(url):
     try:
