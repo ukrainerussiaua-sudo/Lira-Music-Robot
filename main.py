@@ -181,12 +181,13 @@ def get_soundcloud_query(url: str) -> str:
 # ──────────────────────────────────────────────
 # yt-dlp конфиги — несколько клиентов для обхода блокировки
 # ──────────────────────────────────────────────
+COOKIES_PATH = "cookies.txt"
+
 YDL_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Список клиентов для перебора при блокировке
 YT_CLIENTS = [
     ["ios"],
     ["android"],
@@ -195,12 +196,15 @@ YT_CLIENTS = [
 ]
 
 def make_ydl_opts(extra: dict = {}) -> dict:
-    return {
+    opts = {
         "quiet": True,
         "no_warnings": True,
         "http_headers": YDL_HEADERS,
         **extra,
     }
+    if os.path.exists(COOKIES_PATH):
+        opts["cookiefile"] = COOKIES_PATH
+    return opts
 
 def search_tracks(query: str, limit: int = 7) -> list:
     opts = make_ydl_opts({"extract_flat": True})
