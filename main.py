@@ -8,6 +8,8 @@ def install(package):
 for pkg in ["python-telegram-bot==21.5", "yt-dlp", "python-dotenv", "requests"]:
     install(pkg)
 
+# Обновляем yt-dlp до последней версии
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp", "-q"])
 print("✅ Библиотеки установлены, запускаю бота...")
 
 import asyncio
@@ -28,7 +30,7 @@ from telegram import (
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters,
-    InlineQueryHandler, ChosenInlineResultHandler
+    InlineQueryHandler,
 )
 
 load_dotenv()
@@ -84,7 +86,7 @@ def find_or_download_ffmpeg():
 
 threading.Thread(target=find_or_download_ffmpeg, daemon=True).start()
 
-# Очередь треков: track_id → info
+# Хранилище pending треков: track_id → info
 pending_tracks: dict = {}
 user_last_action: dict = {}
 user_reminder_sent: dict = {}
@@ -128,10 +130,11 @@ async def send_welcome(chat_id, context):
     else:
         await context.bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML")
 
-async def show_subscribe_screen(chat_id, context):
+async def show_subscribe_screen(chat_id, context, pending_track_id=None):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Перейти на канал", url="https://t.me/Lira_projects")],
-        [InlineKeyboardButton("✅ Я подписался", callback_data="check_sub")],
+        [InlineKeyboardButton("✅ Я подписался",
+            callback_data=f"check_sub|{pending_track_id or ''}")],
     ])
     caption = (
         "👋 Привет! Добро пожаловать в <b>Lira Music</b> 🎵\n\n"
@@ -175,14 +178,32 @@ def get_soundcloud_query(url: str) -> str:
         parts = url.rstrip("/").split("/")
         return parts[-1].replace("-", " ")
 
+# ──────────────────────────────────────────────
+# yt-dlp конфиги — несколько клиентов для обхода блокировки
+# ──────────────────────────────────────────────
 YDL_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# Список клиентов для перебора при блокировке
+YT_CLIENTS = [
+    ["ios"],
+    ["android"],
+    ["tv_simply"],
+    ["mweb"],
+]
+
+def make_ydl_opts(extra: dict = {}) -> dict:
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "http_headers": YDL_HEADERS,
+        **extra,
+    }
+
 def search_tracks(query: str, limit: int = 7) -> list:
-    opts = {"quiet": True, "no_warnings": True, "extract_flat": True,
-            "http_headers": YDL_HEADERS}
+    opts = make_ydl_opts({"extract_flat": True})
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
         return [{
@@ -201,10 +222,7 @@ def download_audio(url: str, source: str) -> dict:
     elif source == "search":
         url = f"ytsearch1:{url}"
 
-    opts = {
-        "quiet": True, "no_warnings": True,
-        "http_headers": YDL_HEADERS,
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    base_opts = {
         "format": "bestaudio/best",
         "outtmpl": f"{DOWNLOAD_DIR}/%(title)s.%(ext)s",
         "postprocessors": [{"key": "FFmpegExtractAudio",
@@ -213,20 +231,36 @@ def download_audio(url: str, source: str) -> dict:
         "match_filter": yt_dlp.utils.match_filter_func(f"duration <= {MAX_DURATION}"),
     }
     if FFMPEG_LOCATION:
-        opts["ffmpeg_location"] = FFMPEG_LOCATION
+        base_opts["ffmpeg_location"] = FFMPEG_LOCATION
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if "entries" in info:
-            info = info["entries"][0]
-        filename = ydl.prepare_filename(info).rsplit(".", 1)[0] + ".mp3"
-        return {
-            "title": info.get("title", "Unknown"),
-            "duration": info.get("duration", 0),
-            "uploader": info.get("uploader", "Unknown"),
-            "thumbnail": info.get("thumbnail"),
-            "filename": filename,
-        }
+    last_error = None
+    for client in YT_CLIENTS:
+        try:
+            opts = make_ydl_opts({
+                **base_opts,
+                "extractor_args": {"youtube": {"player_client": client}},
+            })
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if "entries" in info:
+                    info = info["entries"][0]
+                filename = ydl.prepare_filename(info).rsplit(".", 1)[0] + ".mp3"
+                return {
+                    "title": info.get("title", "Unknown"),
+                    "duration": info.get("duration", 0),
+                    "uploader": info.get("uploader", "Unknown"),
+                    "thumbnail": info.get("thumbnail"),
+                    "filename": filename,
+                }
+        except Exception as e:
+            last_error = e
+            err_str = str(e).lower()
+            if "sign in" in err_str or "bot" in err_str or "403" in err_str:
+                print(f"⚠️ Клиент {client} заблокирован, пробую следующий...")
+                continue
+            raise e
+
+    raise Exception(f"Все клиенты заблокированы YouTube: {last_error}")
 
 def get_thumb(url):
     try:
@@ -258,44 +292,34 @@ async def idle_reminder_loop(app):
                         pass
 
 # ──────────────────────────────────────────────
-# /start — проверяем есть ли pending трек
+# /start — обрабатывает deep link с track_id
 # ──────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     update_activity(user_id)
 
-    # Проверяем deep link — пришёл из группы за треком
-    if context.args and context.args[0].startswith("track_"):
-        track_id = context.args[0]
-        if track_id in pending_tracks:
-            track_info = pending_tracks[track_id]
-            # Проверяем подписку
-            if not await is_subscribed(user_id, context):
-                # Сохраняем track_id чтобы после подписки отдать трек
-                context.user_data["pending_track"] = track_id
-                await show_subscribe_screen(update.effective_chat.id, context)
-                return
-            # Скачиваем и отправляем
-            msg = await update.message.reply_text(
-                f"⏳ Скачиваю <b>{esc(track_info['title'])}</b>...",
-                parse_mode="HTML"
-            )
-            await _do_download(update.message, context, track_info["url"], "youtube", msg)
-            del pending_tracks[track_id]
-            return
+    track_id = context.args[0] if context.args else None
 
     if not await is_subscribed(user_id, context):
-        await show_subscribe_screen(update.effective_chat.id, context)
+        await show_subscribe_screen(update.effective_chat.id, context, track_id)
         return
+
+    if track_id and track_id in pending_tracks:
+        track_info = pending_tracks[track_id]
+        msg = await update.message.reply_text(
+            f"⏳ Скачиваю <b>{esc(track_info['title'])}</b>...", parse_mode="HTML")
+        await _do_download_to_chat(update.effective_chat.id, context,
+                                   track_info["url"], "youtube", msg)
+        return
+
     await send_welcome(update.effective_chat.id, context)
 
 # ──────────────────────────────────────────────
-# Inline — поиск, в чат летит анонс с кнопкой
+# Inline — поиск, в группу летит анонс с кнопкой
 # ──────────────────────────────────────────────
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.inline_query.query.strip()
-    user_id = update.inline_query.from_user.id
-    update_activity(user_id)
+    update_activity(update.inline_query.from_user.id)
 
     if not q:
         await update.inline_query.answer([
@@ -316,15 +340,13 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     results = []
     for t in tracks:
-        # Создаём уникальный ID для трека
-        track_id = f"track_{uuid.uuid4().hex[:12]}"
+        track_id = f"track_{uuid.uuid4().hex[:16]}"
         pending_tracks[track_id] = {
             "title": t["title"],
             "uploader": t["uploader"],
             "duration": t["duration"],
             "url": t["url"],
         }
-
         deep_link = f"https://t.me/{BOT_USERNAME}?start={track_id}"
 
         results.append(InlineQueryResultArticle(
@@ -338,10 +360,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML"
             ),
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    "🎵 Слушать",
-                    url=deep_link
-                )
+                InlineKeyboardButton("🎵 Слушать", url=deep_link)
             ]])
         ))
 
@@ -361,25 +380,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data
     update_activity(q.from_user.id)
 
-    if data == "check_sub":
+    if data.startswith("check_sub"):
         await q.answer()
+        parts = data.split("|", 1)
+        track_id = parts[1] if len(parts) > 1 and parts[1] else None
+
         if await is_subscribed(q.from_user.id, context):
             try: await q.message.delete()
             except Exception: pass
-            # Есть ли pending трек после подписки?
-            pending = context.user_data.get("pending_track")
-            if pending and pending in pending_tracks:
-                track_info = pending_tracks[pending]
+
+            if track_id and track_id in pending_tracks:
+                track_info = pending_tracks[track_id]
                 msg = await context.bot.send_message(
                     chat_id=q.message.chat_id,
                     text=f"⏳ Скачиваю <b>{esc(track_info['title'])}</b>...",
                     parse_mode="HTML"
                 )
-                # Создаём фейковый message объект
-                await _do_download_by_chat(q.message.chat_id, context,
+                await _do_download_to_chat(q.message.chat_id, context,
                                            track_info["url"], "youtube", msg)
-                del pending_tracks[pending]
-                context.user_data.pop("pending_track", None)
             else:
                 await send_welcome(q.message.chat_id, context)
         else:
@@ -389,7 +407,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("dl|"):
         await q.answer()
         msg = await q.message.reply_text("⏳ Скачиваю...")
-        await _do_download(q.message, context, data[3:], "youtube", msg)
+        await _do_download_to_chat(q.message.chat_id, context,
+                                   data[3:], "youtube", msg)
 
 # ──────────────────────────────────────────────
 # Личные сообщения
@@ -413,7 +432,7 @@ async def _handle_query(update, context, text):
     if source in ("youtube", "soundcloud", "spotify"):
         labels = {"youtube": "YouTube", "soundcloud": "SoundCloud", "spotify": "Spotify"}
         msg = await update.message.reply_text(f"⏳ Скачиваю с {labels[source]}...")
-        await _do_download(update.message, context, text, source, msg)
+        await _do_download_to_chat(update.effective_chat.id, context, text, source, msg)
         return
 
     msg = await update.message.reply_text(
@@ -434,39 +453,15 @@ async def _handle_query(update, context, text):
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
 
-async def _do_download(message, context, url, source, msg):
+# ──────────────────────────────────────────────
+# Скачать и отправить в чат
+# ──────────────────────────────────────────────
+async def _do_download_to_chat(chat_id, context, url, source, msg):
     try:
         info = await asyncio.get_event_loop().run_in_executor(
             None, lambda: download_audio(url, source))
         if info["duration"] and info["duration"] > MAX_DURATION:
             await msg.edit_text("❌ Трек длиннее 10 минут"); return
-        filepath = info["filename"]
-        if not os.path.exists(filepath):
-            await msg.edit_text("❌ Файл не найден"); return
-        if os.path.getsize(filepath) / 1024 / 1024 > 50:
-            await msg.edit_text("❌ Файл >50MB"); cleanup(filepath); return
-        await msg.edit_text(
-            f"📤 Отправляю: <b>{esc(info['title'])}</b>...", parse_mode="HTML")
-        thumb = get_thumb(info["thumbnail"]) if info.get("thumbnail") else None
-        caption = (
-            f"🎵 <b>{esc(info['title'])}</b>\n"
-            f"👤 {esc(info['uploader'])}\n\n"
-            f"<a href='https://t.me/{BOT_USERNAME}'>🎧 Lira Music</a>"
-        )
-        with open(filepath, "rb") as f:
-            await message.reply_audio(
-                audio=f, title=info["title"], performer=info["uploader"],
-                duration=info["duration"], thumbnail=thumb,
-                caption=caption, parse_mode="HTML")
-        await msg.delete()
-        cleanup(filepath)
-    except Exception as e:
-        await msg.edit_text(f"❌ Ошибка: {e}")
-
-async def _do_download_by_chat(chat_id, context, url, source, msg):
-    try:
-        info = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: download_audio(url, source))
         filepath = info["filename"]
         if not os.path.exists(filepath):
             await msg.edit_text("❌ Файл не найден"); return
